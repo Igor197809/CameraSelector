@@ -264,9 +264,10 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            if (imageReader != null) imageReader.close();
-            imageReader = ImageReader.newInstance(photoSize.getWidth(), photoSize.getHeight(), ImageFormat.JPEG, 2);
-            imageReader.setOnImageAvailableListener(reader -> saveNextImage(reader), backgroundHandler);
+            if (imageReader != null) {
+                imageReader.close();
+                imageReader = null;
+            }
 
             statusText.setText("Открываю ID " + selectedCameraId + "…");
             cameraManager.openCamera(selectedCameraId, new CameraDevice.StateCallback() {
@@ -302,7 +303,7 @@ public class MainActivity extends Activity {
             previewBuilder.addTarget(previewSurface);
             previewBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
 
-            cameraDevice.createCaptureSession(Arrays.asList(previewSurface, imageReader.getSurface()),
+            cameraDevice.createCaptureSession(Collections.singletonList(previewSurface),
                     new CameraCaptureSession.StateCallback() {
                         @Override public void onConfigured(CameraCaptureSession session) {
                             if (cameraDevice == null) return;
@@ -328,44 +329,140 @@ public class MainActivity extends Activity {
     }
 
     private void takePhoto() {
-        if (cameraDevice == null || captureSession == null || imageReader == null || isRecording) return;
+        if (cameraDevice == null || isRecording || photoSize == null) return;
+
+        photoButton.setEnabled(false);
+        videoButton.setEnabled(false);
+        statusText.setText("Снимаю фото…");
+
+        closeCaptureSession();
+
         try {
-            final CaptureRequest.Builder still = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            still.addTarget(imageReader.getSurface());
-            still.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            still.set(CaptureRequest.JPEG_ORIENTATION, getJpegOrientation());
-            photoButton.setEnabled(false);
-            statusText.setText("Снимаю фото…");
-            captureSession.capture(still.build(), new CameraCaptureSession.CaptureCallback() {
-                @Override public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
-                    runOnUiThread(() -> photoButton.setEnabled(true));
-                }
-            }, backgroundHandler);
-        } catch (CameraAccessException e) {
+            if (imageReader != null) {
+                imageReader.close();
+                imageReader = null;
+            }
+
+            imageReader = ImageReader.newInstance(
+                    photoSize.getWidth(),
+                    photoSize.getHeight(),
+                    ImageFormat.JPEG,
+                    2);
+
+            final ImageReader reader = imageReader;
+            reader.setOnImageAvailableListener(this::saveNextImage, backgroundHandler);
+
+            cameraDevice.createCaptureSession(
+                    Collections.singletonList(reader.getSurface()),
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(CameraCaptureSession session) {
+                            if (cameraDevice == null || imageReader != reader) {
+                                session.close();
+                                return;
+                            }
+
+                            captureSession = session;
+
+                            try {
+                                CaptureRequest.Builder still =
+                                        cameraDevice.createCaptureRequest(
+                                                CameraDevice.TEMPLATE_STILL_CAPTURE);
+
+                                still.addTarget(reader.getSurface());
+                                still.set(
+                                        CaptureRequest.CONTROL_AF_MODE,
+                                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                                still.set(
+                                        CaptureRequest.JPEG_ORIENTATION,
+                                        getJpegOrientation());
+
+                                session.capture(
+                                        still.build(),
+                                        new CameraCaptureSession.CaptureCallback() {},
+                                        backgroundHandler);
+
+                            } catch (Exception e) {
+                                runOnUiThread(() ->
+                                        showError("Ошибка фото: " + e.getMessage()));
+                                restorePreviewAfterPhoto();
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(CameraCaptureSession session) {
+                            session.close();
+                            runOnUiThread(() ->
+                                    showError("Камера не смогла включить режим фото"));
+                            restorePreviewAfterPhoto();
+                        }
+                    },
+                    backgroundHandler);
+
+        } catch (Exception e) {
             showError("Ошибка фото: " + e.getMessage());
-            photoButton.setEnabled(true);
+            restorePreviewAfterPhoto();
         }
     }
 
     private void saveNextImage(ImageReader reader) {
         Image image = null;
+
         try {
             image = reader.acquireNextImage();
             if (image == null) return;
+
             ByteBuffer buffer = image.getPlanes()[0].getBuffer();
             byte[] bytes = new byte[buffer.remaining()];
             buffer.get(bytes);
+
             String name = "IMG_" + timestamp() + ".jpg";
             Uri uri = saveBytesToGallery(bytes, name, "image/jpeg", true);
+
             runOnUiThread(() -> {
-                statusText.setText(uri != null ? "Фото сохранено: " + name : "Не удалось сохранить фото");
-                if (uri != null) Toast.makeText(this, "Фото сохранено", Toast.LENGTH_SHORT).show();
+                statusText.setText(
+                        uri != null
+                                ? "Фото сохранено: " + name
+                                : "Не удалось сохранить фото");
+
+                if (uri != null) {
+                    Toast.makeText(
+                            this,
+                            "Фото сохранено",
+                            Toast.LENGTH_SHORT
+                    ).show();
+                }
             });
+
         } catch (Exception e) {
-            runOnUiThread(() -> showError("Ошибка сохранения фото: " + e.getMessage()));
+            runOnUiThread(() ->
+                    showError("Ошибка сохранения фото: " + e.getMessage()));
+
         } finally {
             if (image != null) image.close();
+            restorePreviewAfterPhoto();
         }
+    }
+
+    private void restorePreviewAfterPhoto() {
+        closeCaptureSession();
+
+        if (imageReader != null) {
+            try {
+                imageReader.close();
+            } catch (Exception ignored) {
+            }
+            imageReader = null;
+        }
+
+        runOnUiThread(() -> {
+            photoButton.setEnabled(false);
+            videoButton.setEnabled(false);
+
+            if (cameraDevice != null && textureView.isAvailable()) {
+                createPreviewSession();
+            }
+        });
     }
 
     private Uri saveBytesToGallery(byte[] bytes, String name, String mime, boolean photo) throws IOException {
