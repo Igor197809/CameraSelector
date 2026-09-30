@@ -6,6 +6,7 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
@@ -42,6 +43,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -86,6 +88,14 @@ public class MainActivity extends Activity {
     private ParcelFileDescriptor pendingVideoPfd;
     private File legacyVideoFile;
 
+    // Первый реально показанный кадр текущей камеры.
+    // Если камера после него падает, сохраняем этот кадр как фото.
+    private final Object emergencyFrameLock = new Object();
+    private Bitmap emergencyPreviewBitmap;
+    private boolean needEmergencyPreviewFrame = false;
+    private boolean emergencyPreviewSaved = false;
+    private String emergencyPreviewCameraId;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -97,7 +107,40 @@ public class MainActivity extends Activity {
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(12), dp(12), dp(12), dp(12));
+
+        final int basePadding = dp(12);
+        root.setPadding(basePadding, basePadding, basePadding, basePadding);
+
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            int left;
+            int top;
+            int right;
+            int bottom;
+
+            if (Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars =
+                        insets.getInsets(android.view.WindowInsets.Type.systemBars());
+
+                left = bars.left;
+                top = bars.top;
+                right = bars.right;
+                bottom = bars.bottom;
+            } else {
+                left = insets.getSystemWindowInsetLeft();
+                top = insets.getSystemWindowInsetTop();
+                right = insets.getSystemWindowInsetRight();
+                bottom = insets.getSystemWindowInsetBottom();
+            }
+
+            v.setPadding(
+                    basePadding + left,
+                    basePadding + top,
+                    basePadding + right,
+                    basePadding + bottom
+            );
+
+            return insets;
+        });
 
         statusText = new TextView(this);
         statusText.setText("Разрешите доступ к камере");
@@ -137,6 +180,7 @@ public class MainActivity extends Activity {
         root.addView(buttons);
 
         setContentView(root);
+        root.requestApplyInsets();
 
         textureView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
@@ -144,7 +188,9 @@ public class MainActivity extends Activity {
             }
             @Override public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {}
             @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) { return true; }
-            @Override public void onSurfaceTextureUpdated(SurfaceTexture surface) {}
+            @Override public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+                captureEmergencyPreviewFrame();
+            }
         });
 
         photoButton.setOnClickListener(v -> takePhoto());
@@ -247,6 +293,9 @@ public class MainActivity extends Activity {
 
     private void openSelectedCamera() {
         if (!hasCameraPermission() || selectedCameraId == null || !textureView.isAvailable()) return;
+
+        prepareEmergencyPreviewFrame(selectedCameraId);
+
         try {
             CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(selectedCameraId);
             StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
@@ -276,17 +325,20 @@ public class MainActivity extends Activity {
                     createPreviewSession();
                 }
                 @Override public void onDisconnected(CameraDevice camera) {
+                    saveEmergencyPreviewIfAvailable("Камера отключилась");
                     camera.close();
                     cameraDevice = null;
                     runOnUiThread(() -> statusText.setText("Камера отключена"));
                 }
                 @Override public void onError(CameraDevice camera, int error) {
+                    saveEmergencyPreviewIfAvailable("Ошибка камеры " + error);
                     camera.close();
                     cameraDevice = null;
                     runOnUiThread(() -> showError("Ошибка камеры: " + error));
                 }
             }, backgroundHandler);
         } catch (CameraAccessException | SecurityException e) {
+            saveEmergencyPreviewIfAvailable("Ошибка открытия камеры");
             showError("Не удалось открыть камеру: " + e.getMessage());
         }
     }
@@ -316,14 +368,17 @@ public class MainActivity extends Activity {
                                     videoButton.setEnabled(true);
                                 });
                             } catch (CameraAccessException e) {
+                                saveEmergencyPreviewIfAvailable("Ошибка предпросмотра");
                                 runOnUiThread(() -> showError("Ошибка предпросмотра: " + e.getMessage()));
                             }
                         }
                         @Override public void onConfigureFailed(CameraCaptureSession session) {
+                            saveEmergencyPreviewIfAvailable("Сбой предпросмотра");
                             runOnUiThread(() -> showError("Не удалось запустить предпросмотр"));
                         }
                     }, backgroundHandler);
         } catch (CameraAccessException e) {
+            saveEmergencyPreviewIfAvailable("Ошибка предпросмотра");
             showError("Ошибка предпросмотра: " + e.getMessage());
         }
     }
@@ -383,6 +438,7 @@ public class MainActivity extends Activity {
                                         backgroundHandler);
 
                             } catch (Exception e) {
+                                saveEmergencyPreviewIfAvailable("Ошибка фото");
                                 runOnUiThread(() ->
                                         showError("Ошибка фото: " + e.getMessage()));
                                 restorePreviewAfterPhoto();
@@ -392,6 +448,7 @@ public class MainActivity extends Activity {
                         @Override
                         public void onConfigureFailed(CameraCaptureSession session) {
                             session.close();
+                            saveEmergencyPreviewIfAvailable("Сбой режима фото");
                             runOnUiThread(() ->
                                     showError("Камера не смогла включить режим фото"));
                             restorePreviewAfterPhoto();
@@ -400,6 +457,7 @@ public class MainActivity extends Activity {
                     backgroundHandler);
 
         } catch (Exception e) {
+            saveEmergencyPreviewIfAvailable("Ошибка фото");
             showError("Ошибка фото: " + e.getMessage());
             restorePreviewAfterPhoto();
         }
@@ -460,9 +518,174 @@ public class MainActivity extends Activity {
             videoButton.setEnabled(false);
 
             if (cameraDevice != null && textureView.isAvailable()) {
+                prepareEmergencyPreviewFrame(selectedCameraId);
                 createPreviewSession();
             }
         });
+    }
+
+    private void prepareEmergencyPreviewFrame(String cameraId) {
+        synchronized (emergencyFrameLock) {
+            if (emergencyPreviewBitmap != null) {
+                try {
+                    emergencyPreviewBitmap.recycle();
+                } catch (Exception ignored) {
+                }
+            }
+
+            emergencyPreviewBitmap = null;
+            emergencyPreviewCameraId = cameraId;
+            emergencyPreviewSaved = false;
+            needEmergencyPreviewFrame = true;
+        }
+    }
+
+    private void captureEmergencyPreviewFrame() {
+        synchronized (emergencyFrameLock) {
+            if (!needEmergencyPreviewFrame ||
+                    emergencyPreviewSaved ||
+                    emergencyPreviewBitmap != null) {
+                return;
+            }
+        }
+
+        if (textureView == null || !textureView.isAvailable()) return;
+
+        Bitmap bitmap;
+
+        try {
+            bitmap = textureView.getBitmap();
+        } catch (Exception e) {
+            return;
+        }
+
+        if (bitmap == null ||
+                bitmap.getWidth() <= 0 ||
+                bitmap.getHeight() <= 0) {
+            if (bitmap != null) bitmap.recycle();
+            return;
+        }
+
+        synchronized (emergencyFrameLock) {
+            if (!needEmergencyPreviewFrame ||
+                    emergencyPreviewSaved ||
+                    emergencyPreviewBitmap != null) {
+
+                bitmap.recycle();
+                return;
+            }
+
+            emergencyPreviewBitmap = bitmap;
+            needEmergencyPreviewFrame = false;
+        }
+    }
+
+    private void saveEmergencyPreviewIfAvailable(String reason) {
+        final Bitmap bitmap;
+        final String cameraId;
+
+        synchronized (emergencyFrameLock) {
+            if (emergencyPreviewSaved || emergencyPreviewBitmap == null) {
+                // Если кадр уже был показан, но callback ошибки пришёл почти одновременно,
+                // пробуем забрать TextureView ещё один раз с UI-потока.
+                if (!emergencyPreviewSaved &&
+                        textureView != null &&
+                        textureView.isAvailable()) {
+
+                    runOnUiThread(() -> {
+                        captureEmergencyPreviewFrame();
+                        saveEmergencyPreviewNow(reason);
+                    });
+                }
+                return;
+            }
+        }
+
+        saveEmergencyPreviewNow(reason);
+    }
+
+    private void saveEmergencyPreviewNow(String reason) {
+        final Bitmap bitmap;
+        final String cameraId;
+
+        synchronized (emergencyFrameLock) {
+            if (emergencyPreviewSaved || emergencyPreviewBitmap == null) return;
+
+            emergencyPreviewSaved = true;
+            bitmap = emergencyPreviewBitmap;
+            emergencyPreviewBitmap = null;
+            needEmergencyPreviewFrame = false;
+            cameraId = emergencyPreviewCameraId;
+        }
+
+        new Thread(() -> {
+            try {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, bos);
+
+                String safeCameraId = cameraId == null
+                        ? "unknown"
+                        : cameraId.replaceAll("[^A-Za-z0-9_-]", "_");
+
+                String name =
+                        "RECOVERED_CAM_" +
+                        safeCameraId +
+                        "_" +
+                        timestamp() +
+                        ".jpg";
+
+                Uri uri = saveBytesToGallery(
+                        bos.toByteArray(),
+                        name,
+                        "image/jpeg",
+                        true
+                );
+
+                runOnUiThread(() -> {
+                    if (uri != null) {
+                        statusText.setText(
+                                reason + ". Показанный кадр сохранён: " + name);
+
+                        Toast.makeText(
+                                this,
+                                "Кадр камеры сохранён",
+                                Toast.LENGTH_LONG
+                        ).show();
+                    }
+                });
+
+            } catch (Exception e) {
+                runOnUiThread(() ->
+                        Toast.makeText(
+                                this,
+                                "Не удалось сохранить аварийный кадр: " +
+                                        e.getMessage(),
+                                Toast.LENGTH_LONG
+                        ).show());
+
+            } finally {
+                try {
+                    bitmap.recycle();
+                } catch (Exception ignored) {
+                }
+            }
+        }, "EmergencyCameraSave").start();
+    }
+
+    private void clearEmergencyPreviewFrame() {
+        synchronized (emergencyFrameLock) {
+            if (emergencyPreviewBitmap != null) {
+                try {
+                    emergencyPreviewBitmap.recycle();
+                } catch (Exception ignored) {
+                }
+            }
+
+            emergencyPreviewBitmap = null;
+            emergencyPreviewCameraId = null;
+            emergencyPreviewSaved = false;
+            needEmergencyPreviewFrame = false;
+        }
     }
 
     private Uri saveBytesToGallery(byte[] bytes, String name, String mime, boolean photo) throws IOException {
@@ -735,6 +958,7 @@ public class MainActivity extends Activity {
     private void closeCamera() {
         if (isRecording) stopVideoRecording();
         closeCaptureSession();
+        clearEmergencyPreviewFrame();
         if (cameraDevice != null) {
             cameraDevice.close();
             cameraDevice = null;
