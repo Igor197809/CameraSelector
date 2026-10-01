@@ -96,6 +96,11 @@ public class MainActivity extends Activity {
     private boolean emergencyPreviewSaved = false;
     private String emergencyPreviewCameraId;
 
+    // Защитный режим для камер, у которых Samsung Camera HAL
+    // нестабильно работает в обычном режиме.
+    private boolean safeCameraMode = false;
+    private int cameraRetryCount = 0;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -277,13 +282,23 @@ public class MainActivity extends Activity {
                     String newId = cameraIds.get(position);
                     if (!newId.equals(selectedCameraId)) {
                         selectedCameraId = newId;
+                        cameraRetryCount = 0;
+
+                        // На S22 Ultra ID 0 пробуем сразу в консервативном режиме.
+                        safeCameraMode = "0".equals(newId);
+
                         closeCamera();
-                        if (textureView.isAvailable()) openSelectedCamera();
+
+                        if (textureView.isAvailable()) {
+                            openSelectedCamera();
+                        }
                     }
                 }
                 @Override public void onNothingSelected(AdapterView<?> parent) {}
             });
             selectedCameraId = cameraIds.get(0);
+            cameraRetryCount = 0;
+            safeCameraMode = "0".equals(selectedCameraId);
             statusText.setText("Выберите камеру из списка");
             if (textureView.isAvailable()) openSelectedCamera();
         } catch (CameraAccessException e) {
@@ -292,24 +307,46 @@ public class MainActivity extends Activity {
     }
 
     private void openSelectedCamera() {
-        if (!hasCameraPermission() || selectedCameraId == null || !textureView.isAvailable()) return;
+        if (!hasCameraPermission() ||
+                selectedCameraId == null ||
+                !textureView.isAvailable()) {
+            return;
+        }
 
-        prepareEmergencyPreviewFrame(selectedCameraId);
+        final String openingCameraId = selectedCameraId;
+
+        prepareEmergencyPreviewFrame(openingCameraId);
 
         try {
-            CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(selectedCameraId);
-            StreamConfigurationMap map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            CameraCharacteristics characteristics =
+                    cameraManager.getCameraCharacteristics(openingCameraId);
+
+            StreamConfigurationMap map =
+                    characteristics.get(
+                            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+
             if (map == null) {
-                showError("Камера не сообщает поддерживаемые размеры");
+                showError("Камера " + openingCameraId +
+                        " не сообщает поддерживаемые размеры");
                 return;
             }
 
-            previewSize = choosePreviewSize(map.getOutputSizes(SurfaceTexture.class));
-            photoSize = chooseLargest(map.getOutputSizes(ImageFormat.JPEG));
-            videoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder.class));
+            previewSize = choosePreviewSize(
+                    map.getOutputSizes(SurfaceTexture.class),
+                    safeCameraMode);
 
-            if (previewSize == null || photoSize == null || videoSize == null) {
-                showError("Не удалось подобрать режим выбранной камеры");
+            photoSize = choosePhotoSize(
+                    map.getOutputSizes(ImageFormat.JPEG));
+
+            videoSize = chooseVideoSize(
+                    map.getOutputSizes(MediaRecorder.class));
+
+            if (previewSize == null ||
+                    photoSize == null ||
+                    videoSize == null) {
+
+                showError("Не удалось подобрать режим камеры " +
+                        openingCameraId);
                 return;
             }
 
@@ -318,69 +355,399 @@ public class MainActivity extends Activity {
                 imageReader = null;
             }
 
-            statusText.setText("Открываю ID " + selectedCameraId + "…");
-            cameraManager.openCamera(selectedCameraId, new CameraDevice.StateCallback() {
-                @Override public void onOpened(CameraDevice camera) {
-                    cameraDevice = camera;
-                    createPreviewSession();
-                }
-                @Override public void onDisconnected(CameraDevice camera) {
-                    saveEmergencyPreviewIfAvailable("Камера отключилась");
-                    camera.close();
-                    cameraDevice = null;
-                    runOnUiThread(() -> statusText.setText("Камера отключена"));
-                }
-                @Override public void onError(CameraDevice camera, int error) {
-                    saveEmergencyPreviewIfAvailable("Ошибка камеры " + error);
-                    camera.close();
-                    cameraDevice = null;
-                    runOnUiThread(() -> showError("Ошибка камеры: " + error));
-                }
-            }, backgroundHandler);
-        } catch (CameraAccessException | SecurityException e) {
-            saveEmergencyPreviewIfAvailable("Ошибка открытия камеры");
-            showError("Не удалось открыть камеру: " + e.getMessage());
+            statusText.setText(
+                    "Открываю ID " + openingCameraId +
+                    (safeCameraMode ? " [SAFE]…" : "…"));
+
+            cameraManager.openCamera(
+                    openingCameraId,
+                    new CameraDevice.StateCallback() {
+
+                        @Override
+                        public void onOpened(CameraDevice camera) {
+                            if (!openingCameraId.equals(selectedCameraId)) {
+                                camera.close();
+                                return;
+                            }
+
+                            cameraDevice = camera;
+                            createPreviewSession();
+                        }
+
+                        @Override
+                        public void onDisconnected(CameraDevice camera) {
+                            saveEmergencyPreviewIfAvailable(
+                                    "Камера " + openingCameraId +
+                                    " отключилась");
+
+                            camera.close();
+
+                            if (cameraDevice == camera) {
+                                cameraDevice = null;
+                            }
+
+                            scheduleSafeCameraRetry(
+                                    openingCameraId,
+                                    "камера отключилась");
+                        }
+
+                        @Override
+                        public void onError(CameraDevice camera, int error) {
+                            String errorText = cameraErrorText(error);
+
+                            saveEmergencyPreviewIfAvailable(
+                                    "ID " + openingCameraId +
+                                    ": " + errorText);
+
+                            camera.close();
+
+                            if (cameraDevice == camera) {
+                                cameraDevice = null;
+                            }
+
+                            if (!scheduleSafeCameraRetry(
+                                    openingCameraId,
+                                    errorText)) {
+
+                                runOnUiThread(() ->
+                                        showError(
+                                                "ID " +
+                                                openingCameraId +
+                                                ": " +
+                                                errorText));
+                            }
+                        }
+                    },
+                    backgroundHandler);
+
+        } catch (Exception e) {
+            saveEmergencyPreviewIfAvailable(
+                    "Ошибка открытия ID " + openingCameraId);
+
+            showError(
+                    "Не удалось открыть ID " +
+                    openingCameraId +
+                    ": " +
+                    e.getClass().getSimpleName() +
+                    ": " +
+                    e.getMessage());
         }
     }
 
     private void createPreviewSession() {
-        if (cameraDevice == null || !textureView.isAvailable()) return;
+        if (cameraDevice == null ||
+                selectedCameraId == null ||
+                !textureView.isAvailable()) {
+            return;
+        }
+
+        final String sessionCameraId = selectedCameraId;
+
         try {
+            final CameraCharacteristics characteristics =
+                    cameraManager.getCameraCharacteristics(sessionCameraId);
+
             SurfaceTexture texture = textureView.getSurfaceTexture();
+
             if (texture == null) return;
-            texture.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
-            Surface previewSurface = new Surface(texture);
 
-            previewBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            texture.setDefaultBufferSize(
+                    previewSize.getWidth(),
+                    previewSize.getHeight());
+
+            final Surface previewSurface = new Surface(texture);
+
+            previewBuilder =
+                    cameraDevice.createCaptureRequest(
+                            CameraDevice.TEMPLATE_PREVIEW);
+
             previewBuilder.addTarget(previewSurface);
-            previewBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
 
-            cameraDevice.createCaptureSession(Collections.singletonList(previewSurface),
+            final int afMode =
+                    chooseAfMode(characteristics, false);
+
+            previewBuilder.set(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    afMode);
+
+            previewBuilder.set(
+                    CaptureRequest.CONTROL_AF_TRIGGER,
+                    CaptureRequest.CONTROL_AF_TRIGGER_IDLE);
+
+            applyOneXZoom(
+                    previewBuilder,
+                    characteristics);
+
+            cameraDevice.createCaptureSession(
+                    Collections.singletonList(previewSurface),
+
                     new CameraCaptureSession.StateCallback() {
-                        @Override public void onConfigured(CameraCaptureSession session) {
-                            if (cameraDevice == null) return;
+
+                        @Override
+                        public void onConfigured(
+                                CameraCaptureSession session) {
+
+                            if (cameraDevice == null ||
+                                    !sessionCameraId.equals(
+                                            selectedCameraId)) {
+
+                                session.close();
+                                return;
+                            }
+
                             captureSession = session;
+
                             try {
-                                captureSession.setRepeatingRequest(previewBuilder.build(), null, backgroundHandler);
+                                session.setRepeatingRequest(
+                                        previewBuilder.build(),
+                                        null,
+                                        backgroundHandler);
+
+                                // Для safe-mode запускаем автофокус сразу,
+                                // вместо ожидания обычного CONTINUOUS_AF.
+                                if (afMode ==
+                                        CaptureRequest.CONTROL_AF_MODE_AUTO) {
+
+                                    CaptureRequest.Builder focus =
+                                            cameraDevice.createCaptureRequest(
+                                                    CameraDevice.TEMPLATE_PREVIEW);
+
+                                    focus.addTarget(previewSurface);
+
+                                    focus.set(
+                                            CaptureRequest.CONTROL_AF_MODE,
+                                            CaptureRequest.CONTROL_AF_MODE_AUTO);
+
+                                    focus.set(
+                                            CaptureRequest.CONTROL_AF_TRIGGER,
+                                            CaptureRequest.CONTROL_AF_TRIGGER_START);
+
+                                    applyOneXZoom(
+                                            focus,
+                                            characteristics);
+
+                                    session.capture(
+                                            focus.build(),
+                                            new CameraCaptureSession.CaptureCallback() {},
+                                            backgroundHandler);
+                                }
+
                                 runOnUiThread(() -> {
-                                    statusText.setText("Камера ID " + selectedCameraId + " готова");
+                                    statusText.setText(
+                                            "Камера ID " +
+                                            sessionCameraId +
+                                            " готова" +
+                                            (safeCameraMode
+                                                    ? " [SAFE]"
+                                                    : ""));
+
                                     photoButton.setEnabled(true);
                                     videoButton.setEnabled(true);
+
+                                    // Первый кадр уже сохранён как страховка.
+                                    // Если камера проживёт ещё немного —
+                                    // заменяем его более резким.
+                                    textureView.postDelayed(
+                                            thisActivity()::refreshEmergencyPreviewFrame,
+                                            350);
+
+                                    textureView.postDelayed(
+                                            thisActivity()::refreshEmergencyPreviewFrame,
+                                            800);
                                 });
-                            } catch (CameraAccessException e) {
-                                saveEmergencyPreviewIfAvailable("Ошибка предпросмотра");
-                                runOnUiThread(() -> showError("Ошибка предпросмотра: " + e.getMessage()));
+
+                            } catch (Exception e) {
+                                saveEmergencyPreviewIfAvailable(
+                                        "Ошибка preview ID " +
+                                        sessionCameraId);
+
+                                runOnUiThread(() ->
+                                        showError(
+                                                "Preview ID " +
+                                                sessionCameraId +
+                                                ": " +
+                                                e.getClass().getSimpleName() +
+                                                ": " +
+                                                e.getMessage()));
                             }
                         }
-                        @Override public void onConfigureFailed(CameraCaptureSession session) {
-                            saveEmergencyPreviewIfAvailable("Сбой предпросмотра");
-                            runOnUiThread(() -> showError("Не удалось запустить предпросмотр"));
+
+                        @Override
+                        public void onConfigureFailed(
+                                CameraCaptureSession session) {
+
+                            saveEmergencyPreviewIfAvailable(
+                                    "Сбой preview ID " +
+                                    sessionCameraId);
+
+                            runOnUiThread(() ->
+                                    showError(
+                                            "Не удалось запустить preview ID " +
+                                            sessionCameraId));
                         }
-                    }, backgroundHandler);
-        } catch (CameraAccessException e) {
-            saveEmergencyPreviewIfAvailable("Ошибка предпросмотра");
-            showError("Ошибка предпросмотра: " + e.getMessage());
+                    },
+                    backgroundHandler);
+
+        } catch (Exception e) {
+            saveEmergencyPreviewIfAvailable(
+                    "Ошибка preview ID " +
+                    sessionCameraId);
+
+            showError(
+                    "Preview ID " +
+                    sessionCameraId +
+                    ": " +
+                    e.getClass().getSimpleName() +
+                    ": " +
+                    e.getMessage());
         }
+    }
+
+    private MainActivity thisActivity() {
+        return this;
+    }
+
+    private int chooseAfMode(
+            CameraCharacteristics characteristics,
+            boolean video) {
+
+        int[] modes =
+                characteristics.get(
+                        CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+
+        if (modes == null || modes.length == 0) {
+            return CaptureRequest.CONTROL_AF_MODE_OFF;
+        }
+
+        if (safeCameraMode &&
+                containsAfMode(
+                        modes,
+                        CaptureRequest.CONTROL_AF_MODE_AUTO)) {
+
+            return CaptureRequest.CONTROL_AF_MODE_AUTO;
+        }
+
+        if (video &&
+                containsAfMode(
+                        modes,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) {
+
+            return CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+        }
+
+        if (containsAfMode(
+                modes,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
+
+            return CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
+        }
+
+        if (containsAfMode(
+                modes,
+                CaptureRequest.CONTROL_AF_MODE_AUTO)) {
+
+            return CaptureRequest.CONTROL_AF_MODE_AUTO;
+        }
+
+        return modes[0];
+    }
+
+    private boolean containsAfMode(
+            int[] modes,
+            int wanted) {
+
+        for (int mode : modes) {
+            if (mode == wanted) return true;
+        }
+
+        return false;
+    }
+
+    private void applyOneXZoom(
+            CaptureRequest.Builder builder,
+            CameraCharacteristics characteristics) {
+
+        if (Build.VERSION.SDK_INT < 30) return;
+
+        try {
+            android.util.Range<Float> range =
+                    characteristics.get(
+                            CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+
+            if (range != null &&
+                    range.contains(1.0f)) {
+
+                builder.set(
+                        CaptureRequest.CONTROL_ZOOM_RATIO,
+                        1.0f);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private String cameraErrorText(int error) {
+        switch (error) {
+            case CameraDevice.StateCallback.ERROR_CAMERA_IN_USE:
+                return "ERROR_CAMERA_IN_USE (1)";
+
+            case CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE:
+                return "ERROR_MAX_CAMERAS_IN_USE (2)";
+
+            case CameraDevice.StateCallback.ERROR_CAMERA_DISABLED:
+                return "ERROR_CAMERA_DISABLED (3)";
+
+            case CameraDevice.StateCallback.ERROR_CAMERA_DEVICE:
+                return "ERROR_CAMERA_DEVICE (4)";
+
+            case CameraDevice.StateCallback.ERROR_CAMERA_SERVICE:
+                return "ERROR_CAMERA_SERVICE (5)";
+
+            default:
+                return "UNKNOWN_CAMERA_ERROR (" + error + ")";
+        }
+    }
+
+    private boolean scheduleSafeCameraRetry(
+            String cameraId,
+            String reason) {
+
+        if (!cameraId.equals(selectedCameraId)) {
+            return false;
+        }
+
+        if (cameraRetryCount >= 1) {
+            return false;
+        }
+
+        cameraRetryCount++;
+        safeCameraMode = true;
+
+        runOnUiThread(() ->
+                statusText.setText(
+                        "ID " +
+                        cameraId +
+                        ": " +
+                        reason +
+                        ". Повтор SAFE…"));
+
+        Handler h = backgroundHandler;
+
+        if (h == null) {
+            return false;
+        }
+
+        h.postDelayed(() ->
+                runOnUiThread(() -> {
+                    if (cameraId.equals(selectedCameraId) &&
+                            textureView.isAvailable() &&
+                            cameraDevice == null) {
+
+                        openSelectedCamera();
+                    }
+                }),
+                700);
+
+        return true;
     }
 
     private void takePhoto() {
@@ -577,6 +944,54 @@ public class MainActivity extends Activity {
 
             emergencyPreviewBitmap = bitmap;
             needEmergencyPreviewFrame = false;
+        }
+    }
+
+    private void refreshEmergencyPreviewFrame() {
+        if (textureView == null ||
+                !textureView.isAvailable()) {
+            return;
+        }
+
+        synchronized (emergencyFrameLock) {
+            if (emergencyPreviewSaved) return;
+        }
+
+        Bitmap fresh;
+
+        try {
+            fresh = textureView.getBitmap();
+        } catch (Exception e) {
+            return;
+        }
+
+        if (fresh == null ||
+                fresh.getWidth() <= 0 ||
+                fresh.getHeight() <= 0) {
+
+            if (fresh != null) {
+                fresh.recycle();
+            }
+
+            return;
+        }
+
+        synchronized (emergencyFrameLock) {
+            if (emergencyPreviewSaved) {
+                fresh.recycle();
+                return;
+            }
+
+            Bitmap old = emergencyPreviewBitmap;
+            emergencyPreviewBitmap = fresh;
+            needEmergencyPreviewFrame = false;
+
+            if (old != null && old != fresh) {
+                try {
+                    old.recycle();
+                } catch (Exception ignored) {
+                }
+            }
         }
     }
 
@@ -909,20 +1324,106 @@ public class MainActivity extends Activity {
         return 0;
     }
 
-    private Size choosePreviewSize(Size[] sizes) {
-        if (sizes == null || sizes.length == 0) return null;
-        List<Size> list = new ArrayList<>(Arrays.asList(sizes));
-        list.sort(Comparator.comparingLong(s -> (long) s.getWidth() * s.getHeight()));
+    private Size choosePreviewSize(
+            Size[] sizes,
+            boolean safeMode) {
+
+        if (sizes == null || sizes.length == 0) {
+            return null;
+        }
+
+        if (safeMode) {
+            Size exact = findSize(sizes, 1280, 720);
+            if (exact != null) return exact;
+
+            exact = findSize(sizes, 960, 720);
+            if (exact != null) return exact;
+
+            exact = findSize(sizes, 640, 480);
+            if (exact != null) return exact;
+        }
+
+        List<Size> list =
+                new ArrayList<>(Arrays.asList(sizes));
+
+        list.sort(
+                Comparator.comparingLong(
+                        x -> (long) x.getWidth() *
+                                x.getHeight()));
+
         Size fallback = list.get(list.size() - 1);
-        for (Size s : list) {
-            if (s.getWidth() >= 1280 && s.getHeight() >= 720 && s.getWidth() <= 1920 && s.getHeight() <= 1080) {
-                return s;
+
+        for (Size size : list) {
+            if (size.getWidth() >= 1280 &&
+                    size.getHeight() >= 720 &&
+                    size.getWidth() <= 1920 &&
+                    size.getHeight() <= 1080) {
+
+                return size;
             }
         }
-        for (Size s : list) {
-            if (s.getWidth() <= 1920 && s.getHeight() <= 1080) fallback = s;
+
+        for (Size size : list) {
+            if (size.getWidth() <= 1920 &&
+                    size.getHeight() <= 1080) {
+
+                fallback = size;
+            }
         }
+
         return fallback;
+    }
+
+    private Size findSize(
+            Size[] sizes,
+            int width,
+            int height) {
+
+        for (Size size : sizes) {
+            if (size.getWidth() == width &&
+                    size.getHeight() == height) {
+
+                return size;
+            }
+        }
+
+        return null;
+    }
+
+    private Size choosePhotoSize(Size[] sizes) {
+        if (sizes == null || sizes.length == 0) {
+            return null;
+        }
+
+        Size best = null;
+
+        // Не лезем сразу в 50/108 МП режимы Samsung.
+        // Для диагностической камеры выбираем максимум до ~12 МП.
+        final long maxPixels = 12_500_000L;
+
+        for (Size size : sizes) {
+            long pixels =
+                    (long) size.getWidth() *
+                    size.getHeight();
+
+            if (pixels <= maxPixels) {
+                if (best == null ||
+                        pixels >
+                        (long) best.getWidth() *
+                        best.getHeight()) {
+
+                    best = size;
+                }
+            }
+        }
+
+        if (best != null) return best;
+
+        return Collections.min(
+                Arrays.asList(sizes),
+                Comparator.comparingLong(
+                        x -> (long) x.getWidth() *
+                                x.getHeight()));
     }
 
     private Size chooseLargest(Size[] sizes) {
