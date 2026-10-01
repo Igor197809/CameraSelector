@@ -13,7 +13,7 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:requestLegacyExternalStorage="true">
         <activity
-            android:name=".MainActivity"
+            android:name="com.ruslanium.cameraselector.MainActivity"
             android:screenOrientation="unspecified"
             android:configChanges="orientation|screenSize"
             android:exported="true">

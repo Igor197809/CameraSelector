@@ -7,10 +7,10 @@ android {
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.ruslanium.cameraselector'
+        applicationId 'com.ruslanium.cameraselector2'
         minSdk 24
         targetSdk 35
-        versionCode 1
-        versionName '1.0'
+        versionCode 5
+        versionName '1.2'
     }
 }
